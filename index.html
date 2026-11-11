@@ -1,0 +1,139 @@
+<!DOCTYPE html>
+<html lang="uz"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Tank Jang 3D</title>
+<style>
+html,body{margin:0;height:100%;overflow:hidden;background:#111;font-family:system-ui,sans-serif;color:#fff}
+#menu{position:fixed;inset:0;display:flex;flex-direction:column;gap:12px;align-items:center;justify-content:center;background:#1b2a1bcc;z-index:5}
+#menu h1{margin:0 0 8px;font-size:42px;letter-spacing:2px}
+#menu input,#menu button{padding:12px 16px;font-size:18px;border-radius:8px;border:0;width:260px}
+#menu button{background:#e6a800;font-weight:700;cursor:pointer}
+#hud{position:fixed;top:10px;left:10px;font-size:15px;line-height:1.6;background:#0008;padding:8px 12px;border-radius:8px;display:none}
+#help{position:fixed;bottom:10px;left:10px;font-size:13px;opacity:.8;display:none}
+</style></head><body>
+<div id="menu"><h1>TANK JANG 3D</h1>
+<input id="name" placeholder="Ismingiz" maxlength="12">
+<input id="room" placeholder="Xona kodi (masalan: 1234)" maxlength="12">
+<button id="go">O'YNASH (maks. 4 kishi)</button></div>
+<div id="hud"></div><div id="help">W/S – yurish · A/D – burilish · Sichqoncha – nishon · Chap tugma/Space – o'q</div>
+<script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.160.0/build/three.module.js"}}</script>
+<script type="module">
+import * as THREE from 'three';
+import {initializeApp} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js';
+import {getDatabase,ref,update,onValue,push,onChildAdded,onDisconnect,runTransaction} from 'https://www.gstatic.com/firebasejs/10.12.2/firebase-database.js';
+const db=getDatabase(initializeApp({
+  apiKey:"AIzaSyD7lFMqeIzoWZ-tuEByt-U1Zj6KaWFDr1s",authDomain:"bahadir-b268a.firebaseapp.com",
+  databaseURL:"https://bahadir-b268a-default-rtdb.firebaseio.com",projectId:"bahadir-b268a",
+  storageBucket:"bahadir-b268a.firebasestorage.app",messagingSenderId:"397777392294",
+  appId:"1:397777392294:web:b16cfa1b76761e72795a67"}));
+const $=id=>document.getElementById(id);
+const COLORS=[0x3b82f6,0xef4444,0x22c55e,0xeab308], SP=[[-38,-38],[38,-38],[-38,38],[38,38]];
+const BOXES=[[0,0,10,10],[-20,12,4,16],[20,-12,4,16],[-22,-22,8,4],[22,22,8,4],[0,28,16,3],[0,-28,16,3]];
+let room,slot,me,players={},tanks={},bullets=[],keys={},mouse={x:0,y:0},lastShot=0,lastSend=0,deadUntil=0;
+$('go').onclick=async()=>{
+  const name=$('name').value.trim()||'Oyinchi';room=($('room').value.trim()||'main').replace(/[.#$\[\]\/]/g,'');
+  slot=-1;
+  for(let i=0;i<4;i++){
+    const r=await runTransaction(ref(db,`rooms/${room}/p/${i}`),v=>v===null?{n:name,x:SP[i][0],z:SP[i][1],r:0,t:0,hp:100,sc:0}:undefined);
+    if(r.committed){slot=i;break;}
+  }
+  if(slot<0)return alert("Xona to'lgan (4/4). Boshqa kod kiriting.");
+  onDisconnect(ref(db,`rooms/${room}/p/${slot}`)).remove();
+  me={x:SP[slot][0],z:SP[slot][1],r:0,t:0,hp:100};
+  $('menu').style.display='none';$('hud').style.display='block';$('help').style.display='block';
+  startNet();loop();
+};
+// ---------- 3D sahna ----------
+const scene=new THREE.Scene();scene.background=new THREE.Color(0x87b7e0);scene.fog=new THREE.Fog(0x87b7e0,80,170);
+const cam=new THREE.PerspectiveCamera(55,innerWidth/innerHeight,.1,300);
+const rend=new THREE.WebGLRenderer({antialias:true});rend.setSize(innerWidth,innerHeight);rend.shadowMap.enabled=true;
+document.body.appendChild(rend.domElement);
+addEventListener('resize',()=>{cam.aspect=innerWidth/innerHeight;cam.updateProjectionMatrix();rend.setSize(innerWidth,innerHeight)});
+scene.add(new THREE.HemisphereLight(0xffffff,0x445533,.8));
+const sun=new THREE.DirectionalLight(0xffffff,1);sun.position.set(40,70,30);sun.castShadow=true;
+Object.assign(sun.shadow.camera,{left:-70,right:70,top:70,bottom:-70});sun.shadow.mapSize.set(2048,2048);scene.add(sun);
+const ground=new THREE.Mesh(new THREE.PlaneGeometry(100,100),new THREE.MeshLambertMaterial({color:0x5c8a3c}));
+ground.rotation.x=-Math.PI/2;ground.receiveShadow=true;scene.add(ground);
+const M=c=>new THREE.MeshLambertMaterial({color:c});
+BOXES.forEach(([x,z,w,d])=>{const b=new THREE.Mesh(new THREE.BoxGeometry(w,4,d),M(0x8d8d8d));b.position.set(x,2,z);b.castShadow=b.receiveShadow=true;scene.add(b)});
+[[0,-50,100,2],[0,50,100,2],[-50,0,2,100],[50,0,2,100]].forEach(([x,z,w,d])=>{const b=new THREE.Mesh(new THREE.BoxGeometry(w,3,d),M(0x6b4f2a));b.position.set(x,1.5,z);scene.add(b)});
+function makeTank(c){
+  const g=new THREE.Group(),hull=new THREE.Group(),tur=new THREE.Group();
+  const body=new THREE.Mesh(new THREE.BoxGeometry(3,1,4.4),M(c));body.position.y=.9;
+  [-1.8,1.8].forEach(x=>{const tr=new THREE.Mesh(new THREE.BoxGeometry(.8,1,4.8),M(0x222222));tr.position.set(x,.5,0);hull.add(tr)});
+  hull.add(body);
+  const top=new THREE.Mesh(new THREE.BoxGeometry(2,.8,2.2),M(c));top.position.y=1.8;
+  const bar=new THREE.Mesh(new THREE.CylinderGeometry(.18,.18,3.2,10),M(0x333333));bar.rotation.x=Math.PI/2;bar.position.set(0,1.8,2.4);
+  tur.add(top,bar);g.add(hull,tur);g.hull=hull;g.tur=tur;
+  g.traverse(o=>o.castShadow=true);scene.add(g);return g;
+}
+// ---------- Tarmoq ----------
+function startNet(){
+  onValue(ref(db,`rooms/${room}/p`),s=>{
+    players=s.val()||{};
+    for(const k in tanks)if(!players[k]){scene.remove(tanks[k]);delete tanks[k]}
+    for(const k in players)if(k!=slot&&!tanks[k]){tanks[k]=makeTank(COLORS[k]);tanks[k].position.set(players[k].x,0,players[k].z)}
+    if(players[slot]&&players[slot].sc!=null)me.sc=players[slot].sc;
+    hud();
+  });
+  onChildAdded(ref(db,`rooms/${room}/s`),s=>{const v=s.val();if(Date.now()-v.ts<3000)spawnBullet(v.x,v.z,v.a,v.o)});
+}
+function hud(){
+  $('hud').innerHTML=Object.keys(players).map(k=>{const p=players[k];
+    return `<div style="color:#${COLORS[k].toString(16).padStart(6,'0')}">${p.n}${k==slot?' (siz)':''} — HP ${p.hp} · ball ${p.sc}</div>`}).join('');
+}
+function fire(){
+  const now=performance.now();if(now-lastShot<500||now<deadUntil)return;lastShot=now;
+  push(ref(db,`rooms/${room}/s`),{o:slot,x:me.x+Math.sin(me.t)*3.5,z:me.z+Math.cos(me.t)*3.5,a:me.t,ts:Date.now()});
+}
+function spawnBullet(x,z,a,o){
+  const m=new THREE.Mesh(new THREE.SphereGeometry(.35,10,10),new THREE.MeshBasicMaterial({color:0xffdd33}));
+  m.position.set(x,1.8,z);scene.add(m);bullets.push({m,a,o,life:2});
+}
+// ---------- Kiritish ----------
+addEventListener('keydown',e=>{keys[e.code]=1;if(e.code==='Space')fire()});
+addEventListener('keyup',e=>keys[e.code]=0);
+addEventListener('mousemove',e=>{mouse.x=e.clientX/innerWidth*2-1;mouse.y=-(e.clientY/innerHeight)*2+1});
+addEventListener('mousedown',()=>{if(me)fire()});
+const ray=new THREE.Raycaster(),plane=new THREE.Plane(new THREE.Vector3(0,1,0),0),pt=new THREE.Vector3();
+// ---------- O'yin tsikli ----------
+let prev=performance.now();
+function loop(){
+  requestAnimationFrame(loop);
+  const now=performance.now(),dt=Math.min((now-prev)/1000,.05);prev=now;
+  const alive=now>=deadUntil;
+  if(alive){
+    if(keys.KeyA)me.r+=2*dt;if(keys.KeyD)me.r-=2*dt;
+    const v=((keys.KeyW?1:0)-(keys.KeyS?1:0))*14*dt;
+    me.x+=Math.sin(me.r)*v;me.z+=Math.cos(me.r)*v;
+    me.x=Math.max(-47,Math.min(47,me.x));me.z=Math.max(-47,Math.min(47,me.z));
+    for(const [bx,bz,w,d] of BOXES){
+      const dx=me.x-bx,dz=me.z-bz,ox=w/2+2-Math.abs(dx),oz=d/2+2-Math.abs(dz);
+      if(ox>0&&oz>0){if(ox<oz)me.x+=Math.sign(dx)*ox;else me.z+=Math.sign(dz)*oz}
+    }
+    ray.setFromCamera(mouse,cam);if(ray.ray.intersectPlane(plane,pt))me.t=Math.atan2(pt.x-me.x,pt.z-me.z);
+  }
+  if(!tanks[slot])tanks[slot]=makeTank(COLORS[slot]);
+  const mt=tanks[slot];mt.visible=alive;mt.position.set(me.x,0,me.z);mt.hull.rotation.y=me.r;mt.tur.rotation.y=me.t;
+  for(const k in tanks)if(k!=slot&&players[k]){const t=tanks[k],p=players[k];
+    t.position.x+=(p.x-t.position.x)*.25;t.position.z+=(p.z-t.position.z)*.25;
+    t.hull.rotation.y=p.r;t.tur.rotation.y=p.t;t.visible=p.hp>0}
+  for(let i=bullets.length-1;i>=0;i--){
+    const b=bullets[i];b.m.position.x+=Math.sin(b.a)*45*dt;b.m.position.z+=Math.cos(b.a)*45*dt;b.life-=dt;
+    let dead=b.life<=0||Math.abs(b.m.position.x)>49||Math.abs(b.m.position.z)>49;
+    for(const [bx,bz,w,d] of BOXES)if(Math.abs(b.m.position.x-bx)<w/2&&Math.abs(b.m.position.z-bz)<d/2)dead=true;
+    if(!dead&&alive&&b.o!=slot&&Math.hypot(b.m.position.x-me.x,b.m.position.z-me.z)<2.2){
+      dead=true;me.hp-=25;
+      if(me.hp<=0){
+        deadUntil=now+2500;runTransaction(ref(db,`rooms/${room}/p/${b.o}/sc`),v=>(v||0)+1);
+        setTimeout(()=>{me.hp=100;me.x=SP[slot][0];me.z=SP[slot][1];sendNow()},2500);
+      }
+      sendNow();
+    }
+    if(dead){scene.remove(b.m);bullets.splice(i,1)}
+  }
+  if(now-lastSend>66)sendNow();
+  cam.position.set(me.x,42,me.z+30);cam.lookAt(me.x,0,me.z);
+  rend.render(scene,cam);
+}
+function sendNow(){lastSend=performance.now();update(ref(db,`rooms/${room}/p/${slot}`),{x:+me.x.toFixed(2),z:+me.z.toFixed(2),r:+me.r.toFixed(3),t:+me.t.toFixed(3),hp:Math.max(0,me.hp)})}
+</script></body></html>
